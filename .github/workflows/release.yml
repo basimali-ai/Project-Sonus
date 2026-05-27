@@ -1,0 +1,242 @@
+name: Release
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Trigger and Wait for Tests
+        id: run_tests
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $workflowFile = "tests.yml" 
+          $commitSha = "${{ github.sha }}"
+          $refName = "${{ github.ref_name }}"
+
+          Start-Sleep -Seconds 10 
+
+          Write-Host "Checking for existing runs of the test workflow ($workflowFile) on commit $commitSha..."
+
+          $sleepDuration = 5
+          $maxInitialChecks = 12
+          $maxTriggeredChecks = 12
+
+          $n = 0
+          while ($n -lt $maxInitialChecks) {
+              $json = gh run list --workflow $workflowFile --commit $commitSha --json databaseId,status,conclusion
+              $runs = @($json | ConvertFrom-Json)
+
+              if ($runs -and $runs.Count -gt 0) {
+                  $run = $runs | Where-Object { $_.status -ne "completed" -or $_.conclusion -eq "success" } | Select-Object -First 1
+              }
+
+              if ($run) {
+                  break
+              }
+
+              Write-Host "No valid run found yet. Waiting $sleepDuration seconds for potential automatic triggers to register (Attempt $($n + 1)/$maxInitialChecks)..."
+              Start-Sleep -Seconds $sleepDuration
+              $n++
+          }
+
+          if ($run) {
+              $runId = $run.databaseId
+              $status = $run.status
+              Write-Host "Found suitable existing run: $runId with status '$status'."
+          } else {
+              Write-Host "No successful or running tests found after $($sleepDuration * $maxInitialChecks) seconds. Triggering test workflow manually..."
+              
+              $existingRunIds = @()
+              if ($runs) {
+                  $existingRunIds = @($runs.databaseId)
+              }
+
+              gh workflow run $workflowFile --ref $refName
+              
+              $n = 0
+              while ($n -lt $maxTriggeredChecks) {
+                  Start-Sleep -Seconds $sleepDuration
+                  Write-Host "Searching for the triggered workflow run (attempt $($n + 1)/$maxTriggeredChecks)..."
+                  $json = gh run list --workflow $workflowFile --commit $commitSha --json databaseId,status,conclusion
+                  $runs = @($json | ConvertFrom-Json)
+                  
+                  if ($runs -and $runs.Count -gt 0) {
+                      $run = $runs | Where-Object { $_.databaseId -notin $existingRunIds } | Select-Object -First 1
+                      
+                      if ($run) {
+                          $runId = $run.databaseId
+                          $status = $run.status
+                          Write-Host "Triggered run registered with ID: $runId"
+                          break
+                      }
+                  }
+                  $n++
+              }
+              
+              if (-not $run) {
+                  Write-Error "Failed to locate the triggered test workflow run after $maxTriggeredChecks attempts."
+                  exit 1
+              }
+          }
+
+          if ($status -ne "completed") {
+              Write-Host "Watching run $runId until completion..."
+              
+              gh run watch $runId --exit-status *>$null
+              
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Error "Tests failed, timed out, or were cancelled. Aborting release build."
+                  exit 1
+              }
+          } elseif ($run.conclusion -ne "success") {
+              Write-Error "Test run completed but did not succeed (Conclusion: $($run.conclusion)). Aborting release build."
+              exit 1
+          }
+
+          Write-Host "Tests passed successfully. Proceeding with release build."
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.10"
+
+      - name: Restore Previous Build Cache
+        id: restore_cache
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $json = gh run list --workflow "Release" --status success --limit 1 --json databaseId
+          $runs = $json | ConvertFrom-Json
+
+          if ($runs -and $runs.databaseId) {
+              $runId = $runs.databaseId
+              Write-Host "Found previous successful run: $runId. Checking for cache artifact..."
+              
+              "old_run_id=$runId" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              
+              $artifactsJson = gh api repos/$env:GITHUB_REPOSITORY/actions/runs/$runId/artifacts | ConvertFrom-Json
+              $hasCache = $artifactsJson.artifacts | Where-Object { $_.name -eq 'nuitka-build-cache' }
+              
+              if ($hasCache) {
+                  Write-Host "Artifact found, Downloading..."
+                  gh run download $runId --name nuitka-build-cache --dir cache_dir
+                  
+                  if (Test-Path "cache_dir\Nuitka") {
+                      if (!(Test-Path "$env:LOCALAPPDATA")) { New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA" | Out-Null }
+                      Copy-Item -Path "cache_dir\Nuitka" -Destination "$env:LOCALAPPDATA\Nuitka" -Recurse -Force
+                      Write-Host "Restored Nuitka global cache."
+                  }
+              } else {
+                  Write-Host "No cache artifact found on run $runId. Starting fresh."
+              }
+          } else {
+              Write-Host "No previous runs found. Starting fresh."
+          }
+
+      - name: Install dependencies
+        shell: cmd
+        run: call .\scripts\install_dependencies.bat
+
+      - name: Pre-download Dependency Walker for Nuitka
+        shell: powershell
+        run: |
+          $dir = "$env:LOCALAPPDATA\Nuitka\Nuitka\Cache\downloads\depends\x86_64"
+          if (!(Test-Path "$dir\depends.exe")) {
+            [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+
+            Write-Host "Downloading Dependency Walker..."
+            Invoke-WebRequest -Uri "http://dependencywalker.com/depends22_x64.zip" -OutFile "$dir\depends22_x64.zip" -UseBasicParsing
+
+            Write-Host "Extracting depends.exe..."
+            Expand-Archive -Path "$dir\depends22_x64.zip" -DestinationPath $dir -Force
+            Remove-Item "$dir\depends22_x64.zip"
+            Write-Host "Dependency Walker downloaded successfully"
+          } else {
+            Write-Host "Dependency Walker already cached. Skipping download."
+          }
+
+      - name: Build app
+        shell: cmd
+        run: call .\scripts\build.bat
+
+      - name: Compress Release Archive
+        shell: powershell
+        run: |
+          $zipName = "Project-Sonus-${{ github.ref_name }}.zip"
+
+          Compress-Archive -Path "dist\Project Sonus\*" -DestinationPath $zipName -Force
+
+          "ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Create Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+
+          if [[ "$TAG" =~ alpha|beta|rc ]]; then
+            PRERELEASE="--prerelease"
+          else
+            PRERELEASE=""
+          fi
+
+          gh release create "$TAG" "$ZIP_NAME" \
+            --title "$TAG" \
+            $PRERELEASE \
+            --generate-notes
+
+      - name: Prepare Cache for Upload
+        shell: powershell
+        run: |
+          if (Test-Path "cache_dir") { Remove-Item -Path "cache_dir" -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path cache_dir | Out-Null
+          if (Test-Path "$env:LOCALAPPDATA\Nuitka") { Copy-Item -Path "$env:LOCALAPPDATA\Nuitka" -Destination "cache_dir\Nuitka" -Recurse -Force }
+
+      - name: Upload Build Cache
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuitka-build-cache
+          path: cache_dir
+          include-hidden-files: true
+
+      - name: Cleanup Old Cache Artifact
+        if: steps.restore_cache.outputs.old_run_id != ''
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $runId = "${{ steps.restore_cache.outputs.old_run_id }}"
+
+          if ([string]::IsNullOrWhiteSpace($runId)) {
+              Write-Host "Run ID is empty. Skipping cleanup."
+              exit 0
+          }
+
+          Write-Host "Cleaning up old artifact from run $runId..."
+
+          $artifactsJson = gh api repos/$env:GITHUB_REPOSITORY/actions/runs/$runId/artifacts | ConvertFrom-Json
+          $artifactId = $artifactsJson.artifacts | Where-Object { $_.name -eq 'nuitka-build-cache' } | Select-Object -ExpandProperty id
+
+          if ($artifactId) {
+              gh api -X DELETE repos/$env:GITHUB_REPOSITORY/actions/artifacts/$artifactId | Out-Null
+              Write-Host "Successfully deleted old artifact $artifactId."
+          } else {
+              Write-Host "No artifact found to delete."
+          }

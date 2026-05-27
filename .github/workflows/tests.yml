@@ -1,0 +1,101 @@
+name: Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "scripts/**"
+
+jobs:
+  tests:
+    name: Tests
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.10"
+
+      - name: Install Virtual Audio Device
+        uses: AlekseyMartynov/action-vbcable-win@main
+
+      - name: Install dependencies
+        shell: cmd
+        run: call .\scripts\install_dependencies.bat
+
+      - name: Run Pytest
+        run: pytest tests/
+
+      - name: Start Background Audio Playback
+        shell: powershell
+        run: |
+          Write-Host "Starting background looping audio on the default playback device..."
+
+          $scriptToRun = {
+              $player = New-Object System.Media.SoundPlayer "C:\Windows\Media\Alarm01.wav"
+              $player.PlayLooping()
+              while ($true) { Start-Sleep -Seconds 1 }
+          }
+
+          $encodedScript = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptToRun.ToString()))
+          $process = Start-Process powershell.exe -ArgumentList "-NoProfile -WindowStyle Hidden -EncodedCommand $encodedScript" -PassThru
+          $process.Id | Out-File -FilePath "audio_pid.txt" -Force
+
+          Write-Host "Audio is now playing in the background. PID recorded: $($process.Id)"
+
+      - name: Smoke test GUI launch and graceful shutdown
+        shell: python
+        env:
+          PYTHONUNBUFFERED: "1"
+          PYTHONUTF8: "1"
+        run: |
+          import subprocess
+          import time
+          import signal
+          import sys
+
+          SLEEP_SECONDS = 60
+          TIMEOUT_SECONDS = 15
+
+          print("Starting app in the background...")
+          creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+          process = subprocess.Popen(["sonus"], creationflags=creationflags)
+
+          print(f"Waiting {SLEEP_SECONDS} seconds for GUI to initialize...")
+          time.sleep(SLEEP_SECONDS)
+
+          if process.poll() is not None:
+              print(f"::error::App crashed prematurely with exit code {process.returncode}")
+              sys.exit(1)
+
+          print("App is running. Sending close request (WM_CLOSE) via taskkill...")
+          subprocess.run(
+              ["taskkill", "/T", "/pid", str(process.pid)],
+              stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL
+          )
+
+          try:
+              process.wait(timeout=TIMEOUT_SECONDS)
+              print(f"App closed gracefully with exit code {process.returncode}.")
+          except subprocess.TimeoutExpired:
+              print(f"::error::App did not shut down gracefully within {TIMEOUT_SECONDS} seconds. Force killing...")
+              process.kill()
+              sys.exit(1)
+
+      - name: Stop Background Audio Playback
+        if: always()
+        shell: powershell
+        run: |
+          if (Test-Path "audio_pid.txt") {
+              $audioPid = Get-Content "audio_pid.txt"
+              Write-Host "Stopping background audio process (PID $audioPid)..."
+              Stop-Process -Id $audioPid -Force -ErrorAction SilentlyContinue
+          }

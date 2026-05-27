@@ -1,0 +1,24 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp folders/files
+tmp/
+Logs/
+*.deps_ready
+
+# Config/User Data
+UserData/
+Settings/
+
+# Build / dist folders
+build/
+dist/
+*.egg-info/
+
+# IDE / OS / Checkers
+.vscode/
+.idea/
+.DS_Store
+.mypy_cache
